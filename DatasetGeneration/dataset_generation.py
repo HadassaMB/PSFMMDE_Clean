@@ -8,6 +8,18 @@ import torch.nn.functional as F
 from pathlib import Path
 import matplotlib.pyplot as plt
 
+def get_quant_PSF_conv_RGB(PSFs, imset_quant): # imset_quant: (40, 375, 1242, 3), PSFs: (40, 3, 43, 49) -> (40, 375, 1242, 3)
+    """
+    Convolve each quantized image with the corresponding PSF.
+    """
+    imset_conv = []
+    imset_quant_np = np.array(imset_quant)
+    print(imset_quant_np.shape)
+    for i in range(imset_quant_np.shape[0]):
+        im_conv = np.array([cv2.filter2D(imset_quant_np[i,:, :, c]/255, -1, PSFs[i,c,:,:]) for c in range(3)]).transpose((1, 2, 0))
+        imset_conv.append(np.clip(im_conv, 0, 1))
+    return imset_conv
+
 def nn_quantization(depth_map: np.ndarray, depths_sampled: np.ndarray, rgb_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Nearest-neighbour quantization of a depth map using provided stack depths.
 
@@ -167,7 +179,7 @@ class ModelPSFGenerator(PSFGeneratorInterface):
             plt.subplot(1,3,3); plt.imshow(I_cam[a1:a2, b1:b2]); plt.title(f'PSF, z={z_obj_m}[m]'); plt.show()
             """
             PSFs_stack.append(I_cam[a1:a2, b1:b2])
-        psfs = torch.tensor(PSFs_stack, device=self.device).float()
+        psfs = torch.tensor(np.array(PSFs_stack), device=self.device).float()
         return psfs / psfs.sum(dim=(1, 2), keepdim=True)
     
 class DepthAwareImageEncoder:
@@ -215,10 +227,42 @@ class DepthAwareImageEncoder:
     def encode(self, imset_tensor: torch.Tensor, PSFs: list):
         imset_up = F.interpolate(imset_tensor, scale_factor=self.up_factor, mode='nearest')  # Nx3xHxW
         im_final = None
+        use_fft = self.device.type == "cpu"
         for im_d, PSF_d in zip(imset_up, PSFs):
             im_d = im_d.unsqueeze(0)
-            PSF_kernel = PSF_d.unsqueeze(0).unsqueeze(0).repeat(3,1,1,1)
-            im_conv = F.conv2d(im_d, PSF_kernel, padding=PSF_d.shape[0]//2, groups=3).squeeze(0)/255
+            if use_fft:
+                # FFT-based linear convolution (equivalent to spatial conv with same padding)
+                C, H, W = im_d.shape[1:]
+                KH, KW = PSF_d.shape
+                # For linear convolution via FFT: pad to H+KH-1, W+KW-1 to avoid wrap-around
+                fft_h = H + KH - 1
+                fft_w = W + KW - 1
+                # Prepare PSF in frequency domain
+                PSF_padded = F.pad(PSF_d.unsqueeze(0).unsqueeze(0), (0, fft_w - KW, 0, fft_h - KH))  # (1, 1, fft_h, fft_w)
+                PSF_fft = torch.fft.rfft2(PSF_padded)
+                # Convolve each color channel
+                im_conv = torch.zeros_like(im_d)
+                for c in range(C):
+                    im_channel = im_d[:, c:c+1, :, :]  # (1, 1, H, W)
+                    im_padded = F.pad(im_channel, (0, fft_w - W, 0, fft_h - H))  # (1, 1, fft_h, fft_w)
+                    im_fft = torch.fft.rfft2(im_padded)
+                    
+                    # Multiply in frequency domain
+                    conv_fft = im_fft * PSF_fft
+                    
+                    # Inverse FFT
+                    conv_spatial = torch.fft.irfft2(conv_fft, s=(fft_h, fft_w))  # (1, 1, fft_h, fft_w)
+                    
+                    # Crop to output size with same padding
+                    pad_h = KH // 2
+                    pad_w = KW // 2
+                    conv_cropped = conv_spatial[:, :, pad_h:pad_h+H, pad_w:pad_w+W]  # (1, 1, H, W)
+                    im_conv[:, c:c+1, :, :] = conv_cropped
+                im_conv = im_conv.squeeze(0)
+            else:
+                PSF_d_flip = torch.flip(PSF_d, dims=[0, 1])  # Flip for convolution
+                PSF_kernel = PSF_d_flip.unsqueeze(0).unsqueeze(0).repeat(3,1,1,1)
+                im_conv = F.conv2d(im_d, PSF_kernel, padding=PSF_d_flip.shape[0]//2, groups=3).squeeze(0)
             if im_final is None:
                 im_final = im_conv
             else:
@@ -227,6 +271,21 @@ class DepthAwareImageEncoder:
         # Downsample back to original size
         encoded_down = F.interpolate(im_final.unsqueeze(0), scale_factor=1/self.up_factor, mode='nearest').squeeze(0).permute(1,2,0).clamp(0,1)
         return encoded_up, encoded_down
+    
+    def encode_cv2(self, imset_quant, PSFs):
+        """
+        Convolve each quantized image with the corresponding PSF.
+        """
+        imset_conv = []
+        imset_quant_np = imset_quant.permute(0, 2, 3, 1).numpy()  # (B, H, W, C)
+        PSFs_np = PSFs.unsqueeze(1).repeat(1, 3, 1, 1).numpy()
+        print(imset_quant_np.shape, PSFs_np.shape)
+        for i in range(imset_quant_np.shape[0]):
+            im_conv = np.array([cv2.filter2D(imset_quant_np[i,:, :, c], -1, PSFs_np[i,c,:,:]) for c in range(3)]).transpose((1, 2, 0))
+            imset_conv.append(np.clip(im_conv, 0, 1))
+        im_final = np.sum(imset_conv, axis=0)
+        encoded_up = torch.tensor(np.clip(im_final, 0, 1),device=self.device).permute(2, 0, 1)
+        return encoded_up, encoded_up
     
 class DepthAwareConvolver:
     """Orchestrates depth-aware PSF convolution simulation.
@@ -269,7 +328,7 @@ class DepthAwareConvolver:
         self.quantized_depth = self.depth_quantizer._last_quantized
         
         PSFs = self.psf_generator.get_PSFs(unique_depths)
-        encoded_up, encoded_down = self.encoder.encode(imset_tensor, PSFs)
+        encoded_up, encoded_down = self.encoder.encode_cv2(imset_tensor, PSFs)
 
         t_end = time.time()
         self.last_elapsed_time = t_end - t_start
@@ -347,31 +406,44 @@ class DepthAwareConvolver:
         return written
     
 if __name__ == "__main__":
-    camera_properties = {
-                            "mask_path": r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\DatasetGeneration\DH_Leonid.mat",
-                            "wavelength": 530e-3,
-                            "z_defocus": 145.13788098693476,
-                            "p_camera": 4.3,
-                            "D": 32e3,
-                            "f_lens": 100e3,
-                            "ROI_camera": 101,
-                            "Iris": 26e3,
-                            "min_depth": 2.0,
-                            "max_depth": 100.0,
-                            "zero_pos": 69.0
-                        }
+    sim_params = {
+                    "mask_path": r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\DatasetGeneration\DH_Leonid.mat",
+                    "wavelength": 530e-3,
+                    "z_defocus": 145.13788098693476,
+                    "p_camera": 4.3,
+                    "D": 32e3,
+                    "f_lens": 100e3,
+                    "ROI_camera": 101,
+                    "Iris": 26e3,
+                    "min_depth": 2.0,
+                    "max_depth": 100.0,
+                    "zero_pos": 69.0,
+                    "N_depths": 10,
+                    "up_factor": 1,
+                 }
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    psf_generator = ModelPSFGenerator(cam_params=camera_properties, device=device)
-    depth_quantizer = LogSpaceDepthQuantizer(min_depth=0.1, max_depth=100.0, zero_pos=0.0, device=device, N_depths=10)
-    encoder = DepthAwareImageEncoder(up_factor=1, device=device)
+    psf_generator = ModelPSFGenerator(cam_params=sim_params, device=device)
+    depth_quantizer = LogSpaceDepthQuantizer(min_depth=sim_params["min_depth"], max_depth=sim_params["max_depth"],
+                                             zero_pos=sim_params["zero_pos"], device=device, N_depths=sim_params['N_depths'])
+    encoder = DepthAwareImageEncoder(up_factor=sim_params["up_factor"], device=device)
     convolver = DepthAwareConvolver(psf_generator, depth_quantizer, encoder)
     # Load example image and depth (replace with actual paths)
-    im = cv2.imread(r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\Datasets\vkittiv2\rgbs\rgb_00000.jpg")
-    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-    depth = cv2.imread(r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\Datasets\vkittiv2\depths\depth_00000.png", cv2.IMREAD_ANYDEPTH)
+    # im = cv2.imread(r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\Datasets\vkittiv2\rgbs\rgb_00000.jpg")
+    # im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+    # depth = cv2.imread(r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\Datasets\vkittiv2\depths\depth_00000.png", cv2.IMREAD_ANYDEPTH)
 
-    encoded_up, encoded_down = convolver.simulate_image(im, depth)
+    rgb_fn = r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\Datasets/vkittiv2/rgbs/rgb_00344.jpg"
+    d_fn = r"C:\Users\hadassa-m\Desktop\MSc\PSFMMDE-Local\Datasets/vkittiv2/depths/depth_00344.png"
 
+    bgr = cv2.imread(rgb_fn); rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    depth = cv2.imread(d_fn, cv2.IMREAD_ANYDEPTH)
+
+    x_s = 100; y_s = 200; c_s = 256
+    rgb_crop = rgb #[x_s:x_s + c_s, y_s:y_s + c_s, :]
+    depth_crop = depth #[x_s:x_s + c_s, y_s:y_s + c_s]
+
+    encoded_up, encoded_down = convolver.simulate_image(rgb_crop, depth_crop)
+    print('Elapsed time for simulation:', convolver.last_elapsed_time)
     plt.subplot(1, 2, 1); plt.imshow(encoded_up.permute(1, 2, 0).cpu().numpy()); plt.title('Encoded Up (Tensor)')
-    plt.subplot(1, 2, 2); plt.imshow(encoded_down); plt.title('Encoded Down (Numpy)'); plt.show()
+    plt.subplot(1, 2, 2); plt.imshow(encoded_down.permute(1, 2, 0).cpu().numpy()); plt.title('Encoded Down (Numpy)'); plt.show()
